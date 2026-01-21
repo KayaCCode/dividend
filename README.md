@@ -50,7 +50,7 @@ pip install streamlit pandas akshare requests
 运行
 ```bash
 # 第一步：更新最新股票数据
-python dividend_crawler.py
+python update_data.py
 
 # 第二步：启动看板
 streamlit run app.py
