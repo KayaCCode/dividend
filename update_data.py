@@ -17,8 +17,25 @@ DEFAULT_STOCKS = [
     {"code": "601318", "name": "中国平安"}
 ]
 
+def now_date_str():
+    # 导入 datetime 模块
+    from datetime import datetime
+
+    # 获取当前的本地时间
+    current_time = datetime.now()
+
+    # 分别提取年、月、日
+    year = current_time.year    # 年
+    month = current_time.month  # 月
+    day = current_time.day      # 日
+
+    # 也可以直接格式化输出完整的年月日
+    formatted_date = current_time.strftime("%Y-%m-%d")
+    return formatted_date
+
+
 def load_self_selected_stocks():
-    """加载自选股数据（修复原生字符串replace参数）"""
+    """加载自选股数据"""
     try:
         if os.path.exists(SELF_SELECTED_FILE):
             with open(SELF_SELECTED_FILE, "r", encoding="utf-8") as f:
@@ -48,7 +65,7 @@ def load_self_selected_stocks():
         return DEFAULT_STOCKS
 
 def save_self_selected_stocks(stocks):
-    """保存自选股（修复原生字符串replace参数）"""
+    """保存自选股"""
     try:
         # 统一补全6位代码 + 清洗名称空格（修复：去掉regex=False）
         for item in stocks:
@@ -69,7 +86,7 @@ def save_self_selected_stocks(stocks):
         return False
 
 def add_self_selected_stock(code, name):
-    """新增自选股（修复原生字符串replace参数）"""
+    """新增自选股"""
     code = str(code).strip().zfill(6)
     name = name.replace(' ', '')  # 核心修复：去掉regex=False
     stocks = load_self_selected_stocks()
@@ -83,7 +100,6 @@ def add_self_selected_stock(code, name):
     print(f"✅ 新增自选股：{code}({name})")
     return stocks
 
-# ====================== 其余代码完全不变 ======================
 def get_xq_token():
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -103,15 +119,16 @@ def fetch_and_save_data():
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     }
 
-    # 加载自选股
-    self_selected_stocks = load_self_selected_stocks()
+    # 加载股票名称
+    self_selected_stocks = pd.read_csv('data/a_stock_codes.csv')
     stock_list = pd.DataFrame(self_selected_stocks)
     # 强制补全6位代码 + 清洗名称空格（pandas的str.replace支持regex=False，保留）
     stock_list['code'] = stock_list['code'].astype(str).str.zfill(6)
     stock_list['name'] = stock_list['name'].str.replace(' ', '', regex=False)
     stock_list = stock_list.to_dict('records') 
     
-    csv_file = "data/dividend_data.csv"
+    date = now_date_str()
+    csv_file = "data/dividend_data_{date}.csv"
     csv_headers = ["代码", "名称", "最新价", "总市值(亿)", "股息率(%)"]
     
     # 初始化CSV文件

@@ -1,1 +1,6 @@
 .DS_Store
+/data_cache/
+/data/
+/etf_data/
+/figures/
+/logs/
