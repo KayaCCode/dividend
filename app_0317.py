@@ -2,192 +2,190 @@ import streamlit as st
 import pandas as pd
 import baostock as bs
 import akshare as ak
-import re
+import os
 from datetime import datetime
 
-# ====================== 1. 基础工具与缓存 ======================
+# ====================== 1. 基础配置与本地存储 ======================
+PORTFOLIO_FILE = "portfolio.csv"
+
+def load_portfolio():
+    if os.path.exists(PORTFOLIO_FILE):
+        return pd.read_csv(PORTFOLIO_FILE, dtype={'代码': str})
+    else:
+        df = pd.DataFrame([
+            {"代码": "600036", "股票名称": "招商银行", "当前持股": 1000, "目标持股": 2000, "当前成本": 32.50, "预期买入价": 30.00},
+            {"代码": "600886", "股票名称": "国投电力", "当前持股": 2000, "目标持股": 5000, "当前成本": 13.50, "预期买入价": 14.20}
+        ])
+        df.to_csv(PORTFOLIO_FILE, index=False, encoding='utf-8-sig')
+        return df
+
+def save_portfolio(df):
+    df.to_csv(PORTFOLIO_FILE, index=False, encoding='utf-8-sig')
 
 @st.cache_data
 def get_stock_name_map():
-    """获取全量A股代码与名称映射"""
     try:
         import os
         os.environ['http_proxy'] = ''; os.environ['https_proxy'] = ''
         df = ak.stock_info_a_code_name()
         return dict(zip(df['code'], df['name']))
-    except:
-        return {}
+    except: return {}
 
 def get_stock_display_name(symbol):
-    name_map = get_stock_name_map()
-    return name_map.get(symbol, "未知股票")
+    return get_stock_name_map().get(symbol, "未知股票")
 
-# ====================== 2. 核心数据抓取逻辑 ======================
+# ====================== 2. 数据抓取逻辑 ======================
 
-def get_ytd_extremes(symbol):
-    """获取今年至今(YTD)的价格行情"""
-    current_year = datetime.now().year
-    start_date = f"{current_year}-01-01"
-    end_date = datetime.now().strftime('%Y-%m-%d')
+def get_realtime_price(symbol):
     bs_code = f"sh.{symbol}" if symbol.startswith('6') else f"sz.{symbol}"
-    
     bs.login()
-    rs = bs.query_history_k_data_plus(bs_code, "date,high,low,close",
-                                      start_date=start_date, end_date=end_date,
-                                      frequency="d", adjustflag="2")
+    rs = bs.query_history_k_data_plus(bs_code, "date,close", 
+                                      start_date="2025-01-01", frequency="d", adjustflag="2")
     data = []
     while (rs.error_code == '0') & rs.next(): data.append(rs.get_row_data())
     bs.logout()
-    
-    if not data: return None
-    df = pd.DataFrame(data, columns=rs.fields)
-    for col in ['high', 'low', 'close']: 
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-    
-    return {
-        "max": df['high'].max(), 
-        "min": df['low'].min(), 
-        "last": df['close'].iloc[-1], 
-        "year": current_year
-    }
-
-def get_baostock_annual_data(symbol, start_year, end_year):
-    """获取历年价格极值"""
-    name = get_stock_display_name(symbol)
-    bs_code = f"sh.{symbol}" if symbol.startswith('6') else f"sz.{symbol}"
-    bs.login()
-    rs = bs.query_history_k_data_plus(bs_code, "date,high,low,close",
-                                      start_date=f"{start_year}-01-01", end_date=f"{end_year}-12-31",
-                                      frequency="d", adjustflag="2")
-    data = []
-    while (rs.error_code == '0') & rs.next(): data.append(rs.get_row_data())
-    bs.logout()
-    
-    if not data: return None, "未找到价格数据"
-    
-    df = pd.DataFrame(data, columns=rs.fields)
-    df['date'] = pd.to_datetime(df['date'])
-    for col in ['high', 'low', 'close']: 
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-    
-    annual = df.groupby(df['date'].dt.year).agg({'high': 'max', 'low': 'min', 'close': 'last'}).reset_index()
-    annual.columns = ['年份', '年度最高', '年度最低', '年终收盘']
-    annual.insert(1, '股票名称', name)
-    return annual.sort_values(by='年份', ascending=False), None
-
-def get_dividend_pivot_final(symbol):
-    """最终稳定版：基于 CSV 结构优化的数值对齐逻辑"""
-    name = get_stock_display_name(symbol)
     try:
-        import os
-        os.environ['http_proxy'] = ''; os.environ['https_proxy'] = ''
+        return float(data[-1][1]) if data else 0.0
+    except: return 0.0
+
+def get_latest_full_year_dividend(symbol):
+    """获取最近一个完整会计年度的总分红"""
+    try:
         df = ak.stock_dividend_cninfo(symbol=symbol)
-        if df.empty: return None, "接口未返回数据"
-
-        # 1. 直接读取派息比例数值
+        if df.empty: return 0.0
         pay_col = next((c for c in df.columns if '派息' in c and '比例' in c), None)
-        df['10派现'] = pd.to_numeric(df[pay_col], errors='coerce').fillna(0.0) if pay_col else 0.0
-
-        # 2. 智能提取年份 (从“1995年报”等字符串提取)
         report_col = next((c for c in df.columns if '报告时间' in c), None)
-        if not report_col: return None, "未找到报告期字段"
-        
-        df['年份'] = df[report_col].str.extract(r'(\d{4})').astype(float)
-        df = df.dropna(subset=['年份'])
-        df['年份'] = df['年份'].astype(int)
-
-        # 3. 判定分红类型
         type_col = next((c for c in df.columns if '类型' in c), None)
-        def get_label(row):
-            t_str = str(row[type_col]) if type_col else ""
-            return '10股分红（年报）' if ("年度" in t_str or "年报" in t_str) else '10股分红（中报）'
         
-        df['类型'] = [get_label(r) for _, r in df.iterrows()]
-
-        # 4. 透视聚合
-        pivot = df.pivot_table(index='年份', columns='类型', values='10派现', aggfunc='sum').fillna(0.0)
+        df['div_per_share'] = pd.to_numeric(df[pay_col], errors='coerce').fillna(0) / 10.0
+        df['report_year'] = df[report_col].str.extract(r'(\d{4})').astype(float)
         
-        for c in ['10股分红（中报）', '10股分红（年报）']:
-            if c not in pivot.columns: pivot[c] = 0.0
-            
-        pivot['10股分红（总）'] = pivot['10股分红（中报）'] + pivot['10股分红（年报）']
-        pivot = pivot.reset_index()
-        pivot['股票名称'] = name
+        # 按年份聚合
+        annual_total = df.groupby('report_year')['div_per_share'].sum().reset_index().sort_values('report_year', ascending=False)
         
-        final_df = pivot[['年份', '股票名称', '10股分红（中报）', '10股分红（年报）', '10股分红（总）']]
-        return final_df.sort_values(by='年份', ascending=False), None
+        # 寻找最近一个含“年报”的完整年份
+        for _, row in annual_total.iterrows():
+            year = row['report_year']
+            if not df[(df['report_year'] == year) & (df[type_col].str.contains('年度|年报', na=False))].empty:
+                return row['div_per_share']
+        return annual_total.iloc[0]['div_per_share'] if not annual_total.empty else 0.0
+    except: return 0.0
 
-    except Exception as e:
-        return None, f"解析异常: {str(e)}"
+# ====================== 3. UI 界面 ======================
 
-# ====================== 3. Streamlit UI 渲染 ======================
+st.set_page_config(page_title="红利复利管家 v4.0", layout="wide")
+st.markdown("<style>.stDataFrame td, .stDataFrame th { text-align: center !important; } [data-testid='stMetricValue'] { text-align: center; }</style>", unsafe_allow_html=True)
 
-st.set_page_config(page_title="Stock Analysis Dashboard", layout="wide")
+tab1, tab2 = st.tabs(["📊 行情聚合看板", "💼 我的持仓管理"])
 
-# 全局样式：强制表格居中
-st.markdown("""
-    <style>
-    .stDataFrame td, .stDataFrame th { text-align: center !important; }
-    [data-testid="stMetricValue"] { text-align: center; }
-    </style>
-    """, unsafe_allow_html=True)
+with tab1:
+    st.title("股票行情与分红穿透")
+    st.info("💡 系统将自动识别最近一个‘完整’的分红年度进行计算，规避中报数据缺失问题。")
 
-st.title("📊 股票年度波动与分红看板")
-
-# 输入区
-with st.container(border=True):
-    c1, c2, c3, c4 = st.columns([2, 1, 1, 2])
-    with c1: target_code = st.text_input("股票代码", value="600886")
-    with c2: start_y = st.number_input("起始年", 2000, 2026, 2015)
-    with c3: end_y = st.number_input("结束年", 2000, 2026, 2025)
-    with c4:
-        st.write("") 
-        run_query = st.button("🚀 点击同步聚合数据", width='stretch', type="primary")
-
-if run_query:
-    with st.spinner("数据穿透中..."):
-        div_df, div_err = get_dividend_pivot_final(target_code)
-        st.session_state['results'] = {
-            'stock_name': get_stock_display_name(target_code),
-            'ytd': get_ytd_extremes(target_code),
-            'hist': get_baostock_annual_data(target_code, start_y, end_y),
-            'div': div_df,
-            'div_err': div_err
-        }
-
-if 'results' in st.session_state:
-    res = st.session_state['results']
+with tab2:
+    st.title("💼 个人红利账户管理")
     
-    # 模块 A: 年内即时波动
-    if res['ytd']:
-        y = res['ytd']
-        st.subheader(f"✨ {res['stock_name']} ({target_code}) - {y['year']} 年内行情")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("年内最高", f"¥{y['max']:.2f}")
-        m2.metric("年内最低", f"¥{y['min']:.2f}")
-        m3.metric("当前收盘", f"¥{y['last']:.2f}")
-        amp = (y['max']-y['min'])/y['min']*100 if y['min'] > 0 else 0
-        m4.metric("年内振幅", f"{amp:.2f}%")
+    if 'portfolio_df' not in st.session_state:
+        st.session_state.portfolio_df = load_portfolio()
+
+    edited_df = st.data_editor(
+        st.session_state.portfolio_df,
+        num_rows="dynamic", use_container_width=True, hide_index=True,
+        key="editor_final_v4",
+        column_config={
+            "代码": st.column_config.TextColumn("代码", required=True),
+            "当前持股": st.column_config.NumberColumn("当前持股", min_value=0),
+            "目标持股": st.column_config.NumberColumn("目标持股", min_value=0),
+            "当前成本": st.column_config.NumberColumn("当前成本", format="%.3f"),
+            "预期买入价": st.column_config.NumberColumn("预期买入价", format="%.2f"),
+        }
+    )
+
+    if not st.session_state.portfolio_df.equals(edited_df):
+        st.session_state.portfolio_df = edited_df
+        save_portfolio(edited_df)
+        st.rerun()
 
     st.divider()
-    
-    # 模块 B & C: 双表并列展示
-    col_l, col_r = st.columns([4.5, 5.5])
-    
-    with col_l:
-        st.subheader("🗓️ 历年价格极值")
-        p_df, p_err = res['hist']
-        if p_err: st.warning(p_err)
-        else:
-            st.dataframe(p_df.style.format(subset=['年度最高', '年度最低', '年终收盘'], precision=2), 
-                         hide_index=True, width='stretch')
 
-    with col_r:
-        st.subheader("💰 历年分红聚合")
-        if res['div_err']: st.error(res['div_err'])
-        elif res['div'] is not None:
-            st.dataframe(res['div'].style.format(subset=['10股分红（中报）', '10股分红（年报）', '10股分红（总）'], precision=3), 
-                         hide_index=True, width='stretch')
-            st.caption("✅ 数据说明：分红金额已按所属财务报告年度自动归集。")
-else:
-    st.info("💡 请在上方输入股票代码并点击查询按钮。")
+    if st.button("🚀 执行全仓资产穿透计算", type="primary", key="btn_calc_v4"):
+        if edited_df.empty:
+            st.warning("暂无持仓。")
+        else:
+            with st.spinner("正在聚合滚动年度分红与实时行情..."):
+                final_rows = []
+                stats = {
+                    "curr_cost": 0.0, "curr_market": 0.0, "target_inv": 0.0,
+                    "curr_div_amt": 0.0, "target_div_amt": 0.0
+                }
+
+                for _, row in edited_df.iterrows():
+                    raw_code = str(row.get("代码", "")).strip()
+                    if not raw_code: continue
+                    code = raw_code.zfill(6) if raw_code.isdigit() else raw_code
+                    
+                    price = get_realtime_price(code)
+                    div_ps = get_latest_full_year_dividend(code) 
+                    
+                    cur_h = float(row.get("当前持股", 0) or 0)
+                    tgt_h = float(row.get("目标持股", 0) or 0)
+                    cost_p = float(row.get("当前成本", 0) or 0)
+                    exp_p = float(row.get("预期买入价", 0) or 0)
+
+                    # 统计聚合
+                    stats["curr_cost"] += (cost_p * cur_h)
+                    stats["target_inv"] += (exp_p * tgt_h)
+                    stats["curr_div_amt"] += (div_ps * cur_h)
+                    stats["target_div_amt"] += (div_ps * tgt_h)
+
+                    if price > 0:
+                        stats["curr_market"] += (price * cur_h)
+                        profit = (price - cost_p) * cur_h
+                        yield_rate = (div_ps / price * 100)
+                        display_price = price
+                    else:
+                        profit, yield_rate, display_price = 0, 0, "数据异常"
+
+                    final_rows.append({
+                        "名称": get_stock_display_name(code),
+                        "代码": code,
+                        "持股进度": (cur_h / tgt_h * 100) if tgt_h > 0 else 100.0,
+                        "单股分红(年度)": div_ps,
+                        "当前股价": display_price,
+                        "当前盈利": profit,
+                        "当前股息率(%)": yield_rate,
+                        "本年预期分红": div_ps * cur_h,
+                        "满仓预期分红": div_ps * tgt_h
+                    })
+
+                if final_rows:
+                    res_df = pd.DataFrame(final_rows)
+                    st.subheader("📋 持仓穿透明细表")
+                    st.dataframe(
+                        res_df.style.format({
+                            "持股进度": "{:.1f}%", "当前盈利": "¥{:,.2f}", "当前股息率(%)": "{:.2f}%",
+                            "本年预期分红": "¥{:,.2f}", "满仓预期分红": "¥{:,.2f}", "单股分红(年度)": "¥{:.3f}"
+                        }).bar(subset=['持股进度'], color='#00a65a')
+                          .applymap(lambda x: 'color: #ff4b4b' if (isinstance(x, (int, float)) and x > 0) else 'color: #00a65a', subset=['当前盈利']),
+                        hide_index=True, width="stretch"
+                    )
+
+                    st.divider()
+                    st.subheader("💰 资产汇总与目标预判")
+                    
+                    # 第一排：现状
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("当前全仓成本", f"¥{stats['curr_cost']:,.2f}")
+                    c2.metric("当前全仓市值", f"¥{stats['curr_market']:,.2f}", 
+                              delta=f"总盈亏 ¥{stats['curr_market'] - stats['curr_cost']:,.2f}")
+                    curr_acc_yield = (stats['curr_div_amt'] / stats['curr_market'] * 100) if stats['curr_market'] > 0 else 0
+                    c3.metric("★ 账户目前股息率", f"{curr_acc_yield:.2f}%")
+
+                    st.write("")
+                    # 第二排：目标
+                    c4, c5, c6 = st.columns(3)
+                    c4.metric("预期目标总投入", f"¥{stats['target_inv']:,.2f}")
+                    c5.metric("目标满仓后年分红", f"¥{stats['target_div_amt']:,.2f}")
+                    # 计算目标股息率：满仓年分红 / 预期总投入
+                    target_acc_yield = (stats['target_div_amt'] / stats['target_inv'] * 100) if stats['target_inv'] > 0 else 0
+                    c6.metric("🎯 账户预期满仓股息率", f"{target_acc_yield:.2f}%", help="基于(满仓预期年息 / 预期目标总投入)计算")
